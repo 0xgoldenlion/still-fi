@@ -1,13 +1,18 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, IntoVal, Symbol, Vec,
 };
 
-// Import the escrow contract
-mod escrow {
-    soroban_sdk::contractimport!(
-        file = "../../target/wasm32v1-none/release/soroban_escrow_contract.wasm"
-    );
+// Define the Immutables struct locally to match the escrow contract exactly
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Immutables {
+    pub hashlock: BytesN<32>,
+    pub maker: Address,
+    pub taker: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub cancellation_timestamp: u64,
 }
 
 #[contracttype]
@@ -48,7 +53,7 @@ impl SorobanEscrowFactory {
     /// Deploy a new escrow contract with deterministic address
     pub fn deploy_escrow(
         env: Env,
-        immutables: escrow::Immutables,
+        immutables: Immutables,
         salt: BytesN<32>,
     ) -> Result<Address, Error> {
         // Get the stored WASM hash
@@ -64,11 +69,11 @@ impl SorobanEscrowFactory {
             .with_address(env.current_contract_address(), salt)
             .deploy_v2(escrow_wasm_hash, ());
 
-        // Create client and initialize the deployed escrow
-        let escrow_client = escrow::Client::new(&env, &escrow_address);
-
-        // Initialize the escrow contract by calling its initialize function
-        match escrow_client.try_initialize(&immutables) {
+        // Initialize the escrow contract by calling its initialize function directly
+        let initialize_args = Vec::from_array(&env, [immutables.into_val(&env)]);
+        let result: Result<(), soroban_sdk::Error> = env.invoke_contract(&escrow_address, &Symbol::new(&env, "initialize"), initialize_args);
+        
+        match result {
             Ok(_) => {},
             Err(_) => return Err(Error::DeploymentFailed),
         }

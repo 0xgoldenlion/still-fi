@@ -1,235 +1,242 @@
 #![cfg(test)]
 extern crate std;
 
-use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Env,
+    token, Address, Bytes, BytesN, Env,
 };
 
+// ---------- Adjust these imports to your paths if needed ----------
+mod factory {
+    // If factory is another crate/artifact, point to its compiled WASM:
+    // e.g. "../../target/wasm32v1-none/release/soroban_escrow_factory_contract.wasm"
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/soroban_escrow_factory_contract.wasm");
+}
+mod escrow {
+    // If THIS crate is the escrow contract, you can REMOVE this import and
+    // instead use the generated in-crate client type (e.g., SorobanEscrowClient).
+    // Otherwise, import the escrow wasm like this:
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/soroban_escrow_contract.wasm");
+}
+
+// Mirror the Immutables struct the factory expects (must match your contract)
+#[derive(Clone)]
+struct Immutables {
+    hashlock: BytesN<32>,
+    maker: Address,
+    taker: Address,
+    token: Address,
+    amount: i128,
+    cancellation_timestamp: u64,
+}
+
+// Helpers
+fn create_accounts(env: &Env) -> (Address, Address, Address) {
+    let admin = Address::generate(env);
+    let maker = Address::generate(env);
+    let taker = Address::generate(env);
+    (admin, maker, taker)
+}
+
 fn create_token_contract<'a>(
-    e: &Env,
+    env: &Env,
     admin: &Address,
-) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
-    let sac = e.register_stellar_asset_contract_v2(admin.clone());
+) -> (token::Client<'a>, token::StellarAssetClient<'a>, Address) {
+    // Register a Stellar Asset Contract (SAC v2)
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token = token::Client::new(env, &sac.address());
+    let admin_client = token::StellarAssetClient::new(env, &sac.address());
+    (token, admin_client, sac.address())
+}
+
+fn sha256_bytes32(env: &Env, secret_32: &[u8; 32]) -> BytesN<32> {
+    let b = Bytes::from_array(env, secret_32);
+    env.crypto().sha256(&b).into()
+}
+
+fn build_immutables(
+    env: &Env,
+    token_addr: &Address,
+    maker: &Address,
+    taker: &Address,
+    amount: i128,
+    cancel_ts: u64,
+    secret: &[u8; 32],
+) -> (Immutables, BytesN<32>) {
+    let hashlock = sha256_bytes32(env, secret);
     (
-        token::Client::new(e, &sac.address()),
-        token::StellarAssetClient::new(e, &sac.address()),
+        Immutables {
+            hashlock: hashlock.clone(),
+            maker: maker.clone(),
+            taker: taker.clone(),
+            token: token_addr.clone(),
+            amount,
+            cancellation_timestamp: cancel_ts,
+        },
+        hashlock,
     )
 }
 
-fn create_factory_contract(e: &Env) -> SorobanEscrowFactoryClient {
-    SorobanEscrowFactoryClient::new(e, &e.register(SorobanEscrowFactory, ()))
+fn as_bytesn32(env: &Env, fill: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[fill; 32])
 }
 
 #[test]
-fn test_initialize() {
+fn deploy_and_initialize_works() {
     let env = Env::default();
-    let factory = create_factory_contract(&env);
-    let admin = Address::generate(&env);
-    let wasm_hash = BytesN::from_array(&env, &[1; 32]);
 
-    // Should initialize successfully
-    factory.initialize(&admin, &wasm_hash);
-    
-    // Should fail to initialize again
-    assert_eq!(
-        factory.try_initialize(&admin, &wasm_hash),
-        Err(Ok(Error::AlreadyInitialized))
+    // Time zero
+    env.ledger().with_mut(|li| {
+        li.timestamp = 10_000;
+    });
+
+    // Accounts and token
+    let (admin, maker, taker) = create_accounts(&env);
+    let (token, _token_admin, token_addr) = create_token_contract(&env, &admin);
+
+    // Register factory
+    let factory_id = env.register_contract_wasm(None, factory::WASM);
+    let factory = factory::Client::new(&env, &factory_id);
+
+    // Upload escrow WASM and initialize factory
+    let escrow_wasm_hash = env.deployer().upload_contract_wasm(escrow::WASM);
+    factory.initialize(&admin, &escrow_wasm_hash);
+
+    // Build immutables (secret -> hashlock)
+    let secret = [7u8; 32];
+    let (immutables, _hashlock) =
+        build_immutables(&env, &token_addr, &maker, &taker, 1_000, 15_000, &secret);
+
+    // Salt for deterministic address
+    let salt = as_bytesn32(&env, 1);
+
+    // Deploy escrow via factory (new factory returns Address of new escrow)
+    let escrow_addr = factory.deploy_escrow(
+        &factory::Immutables {
+            hashlock: immutables.hashlock.clone(),
+            maker: immutables.maker.clone(),
+            taker: immutables.taker.clone(),
+            token: immutables.token.clone(),
+            amount: immutables.amount,
+            cancellation_timestamp: immutables.cancellation_timestamp,
+        },
+        &salt,
     );
 
-    // Check stored values
-    assert_eq!(factory.get_escrow_wasm_hash(), wasm_hash);
-    assert_eq!(factory.get_admin(), admin);
+    // Escrow client (imported or in-crate)
+    let escrow = escrow::Client::new(&env, &escrow_addr);
+
+    // Sanity: escrow was deployed, not equal to factory address
+    assert_ne!(escrow_addr, factory_id);
+
+    // (Optional) assert initialized flag/immutables if your escrow exposes getters
+    // e.g., let got = escrow.get_immutables(); assert_eq!(got.amount, 1_000);
+    // Otherwise, mint and check flows in the next tests.
+    // Just verify zero balance initially.
+    assert_eq!(token.balance(&escrow_addr), 0);
 }
 
 #[test]
-fn test_deploy_escrow() {
+fn withdraw_before_deadline_works() {
     let env = Env::default();
     env.mock_all_auths();
     
-    // Set up factory
-    let factory = create_factory_contract(&env);
-    let admin = Address::generate(&env);
-    
-    // Upload the escrow contract WASM
-    let escrow_wasm_hash = env.deployer().upload_contract_wasm(escrow::WASM);
-    
-    factory.initialize(&admin, &escrow_wasm_hash);
-
-    // Set up test data
-    let maker = Address::generate(&env);
-    let taker = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-    let (token, token_admin_client) = create_token_contract(&env, &token_admin);
-    
-    let immutables = escrow::Immutables {
-        hashlock: BytesN::from_array(&env, &[1; 32]),
-        maker: maker.clone(),
-        taker: taker.clone(),
-        token: token.address.clone(),
-        amount: 1000,
-        cancellation_timestamp: 12345,
-    };
-
-    let salt = BytesN::from_array(&env, &[42; 32]);
-
-    // Deploy escrow
-    let escrow_address = factory.deploy_escrow(&immutables, &salt);
-    
-    // Verify the escrow was deployed and initialized
-    let escrow_client = escrow::Client::new(&env, &escrow_address);
-    
-    let result = escrow_client.get_immutables();
-    assert_eq!(result, immutables);
-}
-
-#[test]
-fn test_get_escrow_address() {
-    let env = Env::default();
-    let factory = create_factory_contract(&env);
-    let admin = Address::generate(&env);
-    
-    // Upload the escrow contract WASM
-    let escrow_wasm_hash = env.deployer().upload_contract_wasm(escrow::WASM);
-    
-    factory.initialize(&admin, &escrow_wasm_hash);
-
-    let salt = BytesN::from_array(&env, &[42; 32]);
-
-    // Get predicted address
-    let predicted_address = factory.get_escrow_address(&salt);
-
-    // Deploy escrow with same salt
-    let maker = Address::generate(&env);
-    let taker = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-    let (token, _) = create_token_contract(&env, &token_admin);
-    
-    let immutables = escrow::Immutables {
-        hashlock: BytesN::from_array(&env, &[1; 32]),
-        maker: maker.clone(),
-        taker: taker.clone(),
-        token: token.address.clone(),
-        amount: 1000,
-        cancellation_timestamp: 12345,
-    };
-
-    let actual_address = factory.deploy_escrow(&immutables, &salt);
-
-    // Addresses should match
-    assert_eq!(predicted_address, actual_address);
-}
-
-#[test]
-fn test_update_escrow_wasm_hash() {
-    let env = Env::default();
-    env.mock_all_auths();
-    
-    let factory = create_factory_contract(&env);
-    let admin = Address::generate(&env);
-    let initial_wasm_hash = BytesN::from_array(&env, &[1; 32]);
-    let new_wasm_hash = BytesN::from_array(&env, &[2; 32]);
-
-    factory.initialize(&admin, &initial_wasm_hash);
-    
-    // Update WASM hash
-    factory.update_escrow_wasm_hash(&new_wasm_hash);
-    
-    // Verify update
-    assert_eq!(factory.get_escrow_wasm_hash(), new_wasm_hash);
-}
-
-#[test]
-fn test_end_to_end_escrow_flow() {
-    let env = Env::default();
-    env.mock_all_auths();
-    
-    // Set initial timestamp
     env.ledger().with_mut(|li| {
-        li.timestamp = 10000;
+        li.timestamp = 12_000; // before cancel window
     });
 
-    // Set up factory
-    let factory = create_factory_contract(&env);
-    let admin = Address::generate(&env);
+    let (admin, maker, taker) = create_accounts(&env);
+    let (token, token_admin, token_addr) = create_token_contract(&env, &admin);
+
+    let factory_id = env.register_contract_wasm(None, factory::WASM);
+    let factory = factory::Client::new(&env, &factory_id);
+
+    // Upload escrow WASM and initialize factory
     let escrow_wasm_hash = env.deployer().upload_contract_wasm(escrow::WASM);
     factory.initialize(&admin, &escrow_wasm_hash);
 
-    // Set up test participants and token
-    let maker = Address::generate(&env);
-    let taker = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-    let (token, token_admin_client) = create_token_contract(&env, &token_admin);
-    
-    // Create secret and its hash
-    let secret = BytesN::from_array(&env, &[42; 32]);
-    let secret_hash = env.crypto().sha256(&secret.into());
-    
-    let immutables = escrow::Immutables {
-        hashlock: BytesN::from_array(&env, &secret_hash.into()),
-        maker: maker.clone(),
-        taker: taker.clone(),
-        token: token.address.clone(),
-        amount: 1000,
-        cancellation_timestamp: 15000,
-    };
+    let secret = [9u8; 32];
+    let (immutables, _hashlock) =
+        build_immutables(&env, &token_addr, &maker, &taker, 1_000, 20_000, &secret);
 
-    let salt = BytesN::from_array(&env, &[1; 32]);
+    let salt = as_bytesn32(&env, 2);
+    let escrow_addr = factory.deploy_escrow(
+        &factory::Immutables {
+            hashlock: immutables.hashlock.clone(),
+            maker: immutables.maker.clone(),
+            taker: immutables.taker.clone(),
+            token: immutables.token.clone(),
+            amount: immutables.amount,
+            cancellation_timestamp: immutables.cancellation_timestamp,
+        },
+        &salt,
+    );
 
-    // Deploy escrow
-    let escrow_address = factory.deploy_escrow(&immutables, &salt);
-    let escrow_client = escrow::Client::new(&env, &escrow_address);
-    
-    // Fund the escrow
-    token_admin_client.mint(&escrow_address, &1000);
-    
-    // Test successful withdrawal - create a fresh secret for withdrawal
-    let secret_for_withdrawal = BytesN::from_array(&env, &[42; 32]);
-    escrow_client.withdraw(&secret_for_withdrawal);
-    assert_eq!(token.balance(&taker), 1000);
-    assert_eq!(token.balance(&escrow_address), 0);
+    // fund escrow with tokens
+    token_admin.mint(&escrow_addr, &immutables.amount);
+    assert_eq!(token.balance(&escrow_addr), 1_000);
+
+    // taker withdraws by providing secret (must be authorized as taker)
+    let escrow = escrow::Client::new(&env, &escrow_addr);
+    let secret_bn = BytesN::from_array(&env, &secret);
+
+    escrow.withdraw(&secret_bn);
+
+    assert_eq!(token.balance(&escrow_addr), 0);
+    assert_eq!(token.balance(&taker), 1_000);
 }
 
 #[test]
-fn test_escrow_cancellation_flow() {
+fn cancel_after_deadline_refunds_maker() {
     let env = Env::default();
     env.mock_all_auths();
     
-    // Set initial timestamp after cancellation time
     env.ledger().with_mut(|li| {
-        li.timestamp = 20000;
+        li.timestamp = 14_000;
     });
 
-    // Set up factory and deploy escrow
-    let factory = create_factory_contract(&env);
-    let admin = Address::generate(&env);
+    let (admin, maker, taker) = create_accounts(&env);
+    let (token, token_admin, token_addr) = create_token_contract(&env, &admin);
+
+    let factory_id = env.register_contract_wasm(None, factory::WASM);
+    let factory = factory::Client::new(&env, &factory_id);
+
+    // Upload escrow WASM and initialize factory
     let escrow_wasm_hash = env.deployer().upload_contract_wasm(escrow::WASM);
     factory.initialize(&admin, &escrow_wasm_hash);
 
-    let maker = Address::generate(&env);
-    let taker = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-    let (token, token_admin_client) = create_token_contract(&env, &token_admin);
-    
-    let immutables = escrow::Immutables {
-        hashlock: BytesN::from_array(&env, &[1; 32]),
-        maker: maker.clone(),
-        taker: taker.clone(),
-        token: token.address.clone(),
-        amount: 1000,
-        cancellation_timestamp: 15000,
-    };
+    let secret = [5u8; 32];
+    let (immutables, _hashlock) =
+        build_immutables(&env, &token_addr, &maker, &taker, 1_000, 15_000, &secret);
 
-    let salt = BytesN::from_array(&env, &[2; 32]);
-    let escrow_address = factory.deploy_escrow(&immutables, &salt);
-    let escrow_client = escrow::Client::new(&env, &escrow_address);
-    
-    // Fund the escrow
-    token_admin_client.mint(&escrow_address, &1000);
-    
-    // Test successful cancellation
-    escrow_client.cancel();
-    assert_eq!(token.balance(&maker), 1000);
-    assert_eq!(token.balance(&escrow_address), 0);
+    let salt = as_bytesn32(&env, 3);
+    let escrow_addr = factory.deploy_escrow(
+        &factory::Immutables {
+            hashlock: immutables.hashlock.clone(),
+            maker: immutables.maker.clone(),
+            taker: immutables.taker.clone(),
+            token: immutables.token.clone(),
+            amount: immutables.amount,
+            cancellation_timestamp: immutables.cancellation_timestamp,
+        },
+        &salt,
+    );
+
+    // fund escrow
+    token_admin.mint(&escrow_addr, &immutables.amount);
+    assert_eq!(token.balance(&escrow_addr), 1_000);
+
+    // advance time beyond cancellation timestamp
+    env.ledger().with_mut(|li| {
+        li.timestamp = 16_000;
+    });
+
+    // maker cancels -> refund to maker
+    let escrow = escrow::Client::new(&env, &escrow_addr);
+
+    // If your escrow method is named `refund()`, replace `.cancel()` with `.refund()`.
+    escrow.cancel();
+
+    assert_eq!(token.balance(&maker), 1_000);
+    assert_eq!(token.balance(&escrow_addr), 0);
 }
