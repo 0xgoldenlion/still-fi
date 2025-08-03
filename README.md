@@ -41,7 +41,6 @@ This repository contains smart contracts and examples for building **trustless c
 
 1. **Clone the repo**
    ```bash
-   git clone <repo-url>
    cd still-fi-main
    ```
 
@@ -90,5 +89,6 @@ This repository contains smart contracts and examples for building **trustless c
 ### Guides
 * [Setup Instructions](./cross-chain/SETUP.md) - Environment configuration
 * [Script Documentation](./cross-chain/SCRIPTS.md) - Detailed script usage
+
 
 
