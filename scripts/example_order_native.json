@@ -1,0 +1,15 @@
+{
+  "salt": 1234567,
+  "maker": "GD4XRIZEWF7AI5XT5VOQFCGIZO3IYYJL6AORSUECCXSZTE3OBVWW74LA",
+  "receiver": "GDTNYUF7MOYYQ6LID5HUX3M2I63HXH22BFQBIWLHELYQIN43WEEZ4Y6M",
+  "maker_asset": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+  "taker_asset": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+  "making_amount": "10000000",
+  "taking_amount": "20000000",
+  "maker_traits": 0,
+  "auction_start_time": 0,
+  "auction_end_time": 0,
+  "taking_amount_start": "0",
+  "taking_amount_end": "0"
+}
+
