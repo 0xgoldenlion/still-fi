@@ -1,0 +1,14 @@
+{
+  "salt": 43,
+  "maker": "GMAKER...",
+  "receiver": "GTAKER...",
+  "maker_asset": "C...",
+  "taker_asset": "C...",
+  "making_amount": "100000000",
+  "taking_amount": "0",
+  "maker_traits": 1,
+  "auction_start_time": 1754184000,
+  "auction_end_time": 1754187600,
+  "taking_amount_start": "300000000",
+  "taking_amount_end": "150000000"
+}
